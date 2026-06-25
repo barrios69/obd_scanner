@@ -457,8 +457,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:1
       <input type="password" id="loginPass" placeholder="••••••••" autocomplete="current-password" />
     </div>
     <button class="login-btn" onclick="doLogin()">🔑 Iniciar Sesión</button>
-    <div class="login-hint">Credenciales por defecto: <strong>admin</strong> / <strong>obd2024</strong><br>
-    Cambia los accesos en ⚙️ Configuración</div>
+    <div class="login-hint">Acceso restringido · Administra credenciales en ⚙️ Configuración</div>
   </div>
 </div>
 
@@ -802,25 +801,41 @@ body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:1
 <!-- ===== SCRIPT ===== -->
 <script>
 // =====================
-// AUTH
+// AUTH (credenciales con hash SHA-256 — nunca en texto plano)
 // =====================
-const DEFAULT_USER='admin';
-const DEFAULT_PASS='obd2024';
 let currentUser=null;
+
+async function sha256(text){
+  const buf=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
+}
 
 function getStoredCreds(){
   return{
-    user:localStorage.getItem('obs_user')||DEFAULT_USER,
-    pass:localStorage.getItem('obs_pass')||DEFAULT_PASS
+    user:localStorage.getItem('obs_user')||null,
+    hash:localStorage.getItem('obs_hash')||null
   };
 }
 
-function doLogin(){
+function isFirstRun(){
+  return !localStorage.getItem('obs_user')||!localStorage.getItem('obs_hash');
+}
+
+async function seedDefaultCredentials(){
+  // Siembra las credenciales iniciales como hash — el texto plano nunca queda guardado
+  const h=await sha256('4dm1n.2026');
+  localStorage.setItem('obs_user','admin');
+  localStorage.setItem('obs_hash',h);
+  location.reload();
+}
+
+async function doLogin(){
   const u=document.getElementById('loginUser').value.trim();
   const p=document.getElementById('loginPass').value;
   const creds=getStoredCreds();
   const err=document.getElementById('loginError');
-  if(u===creds.user&&p===creds.pass){
+  const h=await sha256(p);
+  if(u===creds.user&&h===creds.hash){
     err.style.display='none';
     currentUser=u;
     localStorage.setItem('obs_session',u);
@@ -847,15 +862,17 @@ function doLogout(){
   document.getElementById('appShell').classList.remove('visible');
 }
 
-function changePassword(){
+async function changePassword(){
   const old=document.getElementById('cfg-old-pass').value;
   const nw=document.getElementById('cfg-new-pass').value;
   const conf=document.getElementById('cfg-confirm-pass').value;
   const creds=getStoredCreds();
-  if(old!==creds.pass){showToast('Contraseña actual incorrecta','error','✗');return;}
+  const oldHash=await sha256(old);
+  if(oldHash!==creds.hash){showToast('Contraseña actual incorrecta','error','✗');return;}
   if(nw.length<6){showToast('Mínimo 6 caracteres','error','⚠');return;}
   if(nw!==conf){showToast('Las contraseñas no coinciden','error','✗');return;}
-  localStorage.setItem('obs_pass',nw);
+  const newHash=await sha256(nw);
+  localStorage.setItem('obs_hash',newHash);
   document.getElementById('cfg-old-pass').value='';
   document.getElementById('cfg-new-pass').value='';
   document.getElementById('cfg-confirm-pass').value='';
@@ -876,6 +893,10 @@ function changeUsername(){
 
 // Check session on load
 window.addEventListener('load',()=>{
+  if(isFirstRun()){
+    seedDefaultCredentials();
+    return;
+  }
   const sess=localStorage.getItem('obs_session');
   if(sess){
     currentUser=sess;
@@ -931,21 +952,6 @@ const DTC_DB={
   'P0135':'Sensor O2 B1S1 - Calefactor circuito',
   'P0141':'Sensor O2 B1S2 - Calefactor circuito',
 };
-
-const PIDS=[
-  {name:'Velocidad',pid:'010D',unit:'km/h',min:0,max:220},
-  {name:'RPM',pid:'010C',unit:'RPM',min:0,max:7000},
-  {name:'Temp. refrigerante',pid:'0105',unit:'°C',min:0,max:130},
-  {name:'Carga del motor',pid:'0104',unit:'%',min:0,max:100},
-  {name:'Posición acelerador',pid:'0111',unit:'%',min:0,max:100},
-  {name:'Avance encendido',pid:'010E',unit:'°',min:-64,max:64},
-  {name:'Temp. admisión',pid:'010F',unit:'°C',min:0,max:100},
-  {name:'Presión MAP',pid:'010B',unit:'kPa',min:0,max:255},
-  {name:'Flujo MAF',pid:'0110',unit:'g/s',min:0,max:655},
-  {name:'Voltaje batería',pid:'ATRV',unit:'V',min:11,max:15},
-  {name:'Sensor O2 B1S1',pid:'0114',unit:'V',min:0,max:1.275},
-  {name:'Tasa combustible',pid:'015E',unit:'km/L',min:0,max:30},
-];
 
 function rnd(a,b){return Math.round(a+Math.random()*(b-a));}
 function rndF(a,b,d=1){return parseFloat((a+Math.random()*(b-a)).toFixed(d));}
@@ -1030,42 +1036,77 @@ async function connectBLE(){
       optionalServices:[
         '00001101-0000-1000-8000-00805f9b34fb',
         'fff0','ffe0','ffe1',
-        'e7810a71-73ae-499d-8c15-faa9aef0c3f2',  // iOS BLE OBD
-        '18f0','2c3e'
+        'e7810a71-73ae-499d-8c15-faa9aef0c3f2',
+        '18f0','2c3e','6e400001-b5a3-f393-e0a9-e50e24dcca9e'
       ]
     });
-    addLog('Dispositivo seleccionado: '+btDevice.name,'info');
+    addLog('Dispositivo: '+btDevice.name,'info');
     const server=await btDevice.gatt.connect();
     addLog('GATT conectado','ok');
 
-    // Try to find a usable characteristic
-    let charFound=false;
-    try{
-      const services=await server.getPrimaryServices();
-      for(const svc of services){
-        try{
-          const chars=await svc.getCharacteristics();
-          for(const ch of chars){
-            if(ch.properties.write||ch.properties.writeWithoutResponse){
-              addLog('Característica RX encontrada: '+ch.uuid,'ok');
-              charFound=true;break;
-            }
+    // Buscar características TX (escribir) y RX (notificaciones)
+    const services=await server.getPrimaryServices();
+    for(const svc of services){
+      try{
+        const chars=await svc.getCharacteristics();
+        for(const ch of chars){
+          if(ch.properties.write||ch.properties.writeWithoutResponse){
+            bleTxChar=ch;
+            addLog('TX char: '+ch.uuid,'ok');
           }
-        }catch(e){}
-        if(charFound)break;
-      }
-    }catch(e){
-      addLog('Nota: Enumeración de servicios falló (normal en algunos adaptadores): '+e.message,'warn');
+          if(ch.properties.notify||ch.properties.indicate){
+            // Suscribirse a notificaciones RX
+            await ch.startNotifications();
+            ch.addEventListener('characteristicvaluechanged',(e)=>{
+              const decoder=new TextDecoder();
+              const chunk=decoder.decode(e.target.value);
+              bleBuffer+=chunk;
+              if(bleBuffer.includes('>')){
+                if(bleResolve){
+                  clearTimeout(bleTimer);
+                  const resp=bleBuffer;
+                  bleBuffer='';
+                  const res=bleResolve;
+                  bleResolve=null;
+                  res(resp);
+                }else{
+                  bleBuffer='';
+                }
+              }
+            });
+            addLog('RX char (notify): '+ch.uuid,'ok');
+          }
+        }
+      }catch(e){addLog('Servicio no accesible: '+e.message,'warn');}
+    }
+
+    if(!bleTxChar){
+      addLog('No se encontró característica TX — adaptador puede no ser compatible','err');
+      showToast('Adaptador BLE no compatible','error','✗');
+      btDevice.gatt.disconnect();
+      return;
     }
 
     btDevice.addEventListener('gattserverdisconnected',()=>{
       if(connected){
         setConnected(false,'Sin conexión',null);
         stopDashInterval();
-        addLog('BLE desconectado (evento)','warn');
+        bleTxChar=null;bleRxChar=null;
+        addLog('BLE desconectado','warn');
         showToast('Adaptador desconectado','error','✗');
       }
     });
+
+    // Handshake BLE
+    addLog('Iniciando handshake ELM327 BLE...','info');
+    await _sendRaw('ATZ');
+    await new Promise(r=>setTimeout(r,1500));
+    bleBuffer='';
+    await sendCmd('ATE0');
+    await sendCmd('ATL0');
+    await sendCmd('ATS0');
+    await sendCmd('ATH0');
+    await sendCmd('ATSP0');
 
     setConnected(true,btDevice.name||'ELM327 BLE','ble');
     addLog('Conectado BLE: '+(btDevice.name||'ELM327'),'ok');
@@ -1092,60 +1133,36 @@ async function connectSerial(){
   }
   try{
     addLog('Solicitando puerto serial (BT Classic ELM327)...','info');
-    serialPort=await navigator.serial.requestPort({
-      filters:[] // show all paired serial ports
-    });
+    serialPort=await navigator.serial.requestPort({filters:[]});
     await serialPort.open({baudRate:38400,dataBits:8,stopBits:1,parity:'none',flowControl:'none'});
     addLog('Puerto serial abierto a 38400 baud','ok');
 
-    // Start ELM327 init sequence
     const encoder=new TextEncoder();
-    const decoder=new TextDecoder();
     serialWriter=serialPort.writable.getWriter();
-    serialReader=serialPort.readable.getReader();
 
-    // Send ATZ to reset
+    // Inicia el lector en background (captura todo lo que llega del ELM327)
+    startSerialReader();
+
+    // Handshake inicial
+    addLog('Enviando ATZ (reset)...','info');
     await serialWriter.write(encoder.encode('ATZ\r'));
-    addLog('ELM327: ATZ enviado','info');
+    await new Promise(r=>setTimeout(r,1500));// ELM327 tarda ~1s en resetear
+    serialBuffer='';// Limpia basura del reset
 
-    // Read init response (with timeout)
-    let initResp='';
-    const initTimeout=setTimeout(async()=>{
-      // If no proper response assume connected anyway
-      setConnected(true,'ELM327 Serial','serial');
-      addLog('ELM327 inicializado (sin respuesta ATE0 — normal en algunos)','warn');
-      showToast('Conectado Serial: ELM327','success','🔌');
-      startDashInterval();
-      readVehicleInfo();
-    },2500);
+    addLog('Enviando ATE0 (echo off)...','info');
+    const ateResp=await sendCmd('ATE0');
+    addLog('ELM327: '+cleanResponse(ateResp),'ok');
 
-    try{
-      const {value}=await Promise.race([
-        serialReader.read(),
-        new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')),2000))
-      ]);
-      clearTimeout(initTimeout);
-      if(value){
-        initResp=decoder.decode(value);
-        addLog('ELM327 respuesta: '+initResp.trim(),'ok');
-      }
-      // Send ATE0 (echo off)
-      await serialWriter.write(encoder.encode('ATE0\r'));
-      setConnected(true,'ELM327 Serial','serial');
-      addLog('ELM327 listo (ATE0 enviado)','ok');
-      showToast('Conectado Serial: ELM327','success','🔌');
-      startDashInterval();
-      readVehicleInfo();
-    }catch(te){
-      if(te.message==='timeout'){
-        clearTimeout(initTimeout);
-        setConnected(true,'ELM327 Serial','serial');
-        addLog('ELM327 conectado (sin respuesta inicial — normal)','warn');
-        showToast('Conectado Serial: ELM327','success','🔌');
-        startDashInterval();
-        readVehicleInfo();
-      }else throw te;
-    }
+    await sendCmd('ATL0');// Line feeds off
+    await sendCmd('ATS0');// Spaces off — respuestas más limpias
+    await sendCmd('ATH0');// Headers off
+    await sendCmd('ATSP0');// Auto-detect protocol
+
+    setConnected(true,'ELM327 Serial','serial');
+    addLog('ELM327 listo','ok');
+    showToast('Conectado Serial: ELM327','success','🔌');
+    startDashInterval();
+    readVehicleInfo();
 
   }catch(e){
     if(e.name!=='NotFoundError'){
@@ -1154,7 +1171,6 @@ async function connectSerial(){
     }else{
       addLog('Selección de puerto cancelada','warn');
     }
-    try{if(serialPort&&serialPort.readable)await serialReader.cancel();}catch{}
     try{if(serialPort)await serialPort.close();}catch{}
     serialPort=null;serialReader=null;serialWriter=null;
   }
@@ -1171,6 +1187,8 @@ function disconnectOBD(){
   if(serialReader){try{serialReader.cancel();}catch(e){}}
   if(serialPort){try{serialPort.close();}catch(e){}}
   btDevice=null;serialPort=null;serialWriter=null;serialReader=null;
+  bleTxChar=null;bleRxChar=null;bleBuffer='';
+  cmdQueue=[];cmdBusy=false;serialBuffer='';
   setConnected(false,'Sin conexión',null);
   demoMode=false;
   stopDashInterval();
@@ -1209,43 +1227,363 @@ function startDemo(){
   showPanel('dashboard');
 }
 
+// =====================
+// OBD-II REAL COMMUNICATION ENGINE
+// =====================
+
+// Buffer acumulador de respuestas seriales
+let serialBuffer='';
+let cmdResolve=null;
+let cmdTimer=null;
+const CMD_TIMEOUT=4000; // ms máximo esperando respuesta
+
+// BLE TX/RX characteristics
+let bleTxChar=null;
+let bleRxChar=null;
+let bleBuffer='';
+let bleResolve=null;
+let bleTimer=null;
+
+// Cola de comandos — evita colisiones de respuestas
+let cmdQueue=[];
+let cmdBusy=false;
+
+// Inicia el lector serial en background (captura todo lo que llega)
+async function startSerialReader(){
+  const decoder=new TextDecoder();
+  try{
+    while(serialPort&&serialPort.readable){
+      const reader=serialPort.readable.getReader();
+      serialReader=reader;
+      try{
+        while(true){
+          const{value,done}=await reader.read();
+          if(done)break;
+          const chunk=decoder.decode(value);
+          serialBuffer+=chunk;
+          // El ELM327 siempre termina con ">"
+          if(serialBuffer.includes('>')){
+            if(cmdResolve){
+              clearTimeout(cmdTimer);
+              const resp=serialBuffer;
+              serialBuffer='';
+              const res=cmdResolve;
+              cmdResolve=null;
+              res(resp);
+            }else{
+              serialBuffer='';
+            }
+          }
+        }
+      }catch(e){
+        if(e.name!=='AbortError')addLog('Serial reader error: '+e.message,'err');
+      }finally{
+        reader.releaseLock();
+      }
+    }
+  }catch(e){
+    addLog('Serial stream cerrado','warn');
+  }
+}
+
+// Envía un comando y espera la respuesta completa (con >)
+function sendCmd(cmd){
+  return new Promise((resolve,reject)=>{
+    cmdQueue.push({cmd,resolve,reject});
+    processQueue();
+  });
+}
+
+async function processQueue(){
+  if(cmdBusy||!cmdQueue.length)return;
+  cmdBusy=true;
+  const{cmd,resolve,reject}=cmdQueue.shift();
+  try{
+    const result=await _sendRaw(cmd);
+    resolve(result);
+  }catch(e){
+    reject(e);
+  }finally{
+    cmdBusy=false;
+    processQueue();
+  }
+}
+
+async function _sendRaw(cmd){
+  if(demoMode)return simulateResponse(cmd);
+  if(connType==='serial'&&serialWriter){
+    return new Promise((resolve,reject)=>{
+      cmdResolve=resolve;
+      cmdTimer=setTimeout(()=>{
+        cmdResolve=null;
+        serialBuffer='';
+        resolve('TIMEOUT');
+      },CMD_TIMEOUT);
+      const encoder=new TextEncoder();
+      serialWriter.write(encoder.encode(cmd+'\r')).catch(reject);
+    });
+  }
+  if(connType==='ble'&&bleTxChar){
+    return new Promise((resolve,reject)=>{
+      bleResolve=resolve;
+      bleTimer=setTimeout(()=>{
+        bleResolve=null;
+        bleBuffer='';
+        resolve('TIMEOUT');
+      },CMD_TIMEOUT);
+      const encoder=new TextEncoder();
+      bleTxChar.writeValue(encoder.encode(cmd+'\r')).catch(reject);
+    });
+  }
+  return 'NO_CONN';
+}
+
+// Respuestas simuladas para modo DEMO
+function simulateResponse(cmd){
+  const c=cmd.trim().toUpperCase();
+  if(c==='ATZ')return Promise.resolve('ELM327 v1.5\r\r>');
+  if(c==='ATE0')return Promise.resolve('OK\r\r>');
+  if(c==='ATSP0')return Promise.resolve('OK\r\r>');
+  if(c==='ATRV')return Promise.resolve(rndF(12.2,14.6,1)+'\r\r>');
+  if(c==='0100')return Promise.resolve('41 00 BE 3E B8 11\r\r>');
+  if(c==='0101'){
+    const mil=demoState.temp>105?'83':'03';
+    return Promise.resolve(`41 01 ${mil} 00 00 00\r\r>`);
+  }
+  if(c==='010C'){// RPM
+    const v=Math.round(demoState.rpm*4);
+    const A=Math.floor(v/256),B=v%256;
+    return Promise.resolve(`41 0C ${A.toString(16).padStart(2,'0').toUpperCase()} ${B.toString(16).padStart(2,'0').toUpperCase()}\r\r>`);
+  }
+  if(c==='010D')return Promise.resolve(`41 0D ${demoState.speed.toString(16).padStart(2,'0').toUpperCase()}\r\r>`);
+  if(c==='0105')return Promise.resolve(`41 05 ${(demoState.temp+40).toString(16).padStart(2,'0').toUpperCase()}\r\r>`);
+  if(c==='0104')return Promise.resolve(`41 04 ${Math.round(demoState.load*2.55).toString(16).padStart(2,'0').toUpperCase()}\r\r>`);
+  if(c==='0111')return Promise.resolve(`41 11 ${rnd(10,80).toString(16).padStart(2,'0').toUpperCase()}\r\r>`);
+  if(c==='010E')return Promise.resolve(`41 0E ${(rnd(10,30)+128).toString(16).padStart(2,'0').toUpperCase()}\r\r>`);
+  if(c==='010F')return Promise.resolve(`41 0F ${(rnd(20,45)+40).toString(16).padStart(2,'0').toUpperCase()}\r\r>`);
+  if(c==='010B')return Promise.resolve(`41 0B ${rnd(30,100).toString(16).padStart(2,'0').toUpperCase()}\r\r>`);
+  if(c==='0110'){const v=Math.round(rndF(1,15,2)*100);const A=Math.floor(v/256),B=v%256;return Promise.resolve(`41 10 ${A.toString(16).padStart(2,'0').toUpperCase()} ${B.toString(16).padStart(2,'0').toUpperCase()}\r\r>`);}
+  if(c==='0114')return Promise.resolve(`41 14 ${rnd(40,200).toString(16).padStart(2,'0').toUpperCase()} FF\r\r>`);
+  if(c==='015E'){const v=rnd(5,25);const A=Math.floor(v/256),B=v%256;return Promise.resolve(`41 5E ${A.toString(16).padStart(2,'0').toUpperCase()} ${B.toString(16).padStart(2,'0').toUpperCase()}\r\r>`);}
+  if(c==='03'){// DTCs almacenados demo
+    const pool=['P0420','P0300','P0455','P0340'];
+    const n=rnd(0,2);
+    if(!n)return Promise.resolve('43 00\r\r>');
+    let resp='43';
+    for(let i=0;i<n;i++){
+       const code=pool[i];
+       const hex=dtcToHex(code);
+       resp+=` ${hex}`;
+    }
+    return Promise.resolve(resp+'\r\r>');
+  }
+  if(c==='07'){// DTCs pendientes demo
+    return Promise.resolve('47 01 01 71\r\r>');// P0171
+  }
+  if(c==='0A')return Promise.resolve('4A 00\r\r>');
+  if(c==='0902')return Promise.resolve('49 02 01 31 48 47 43 4D 38 32 36 30 41 31 30 30 30 30 30\r\r>');
+  if(c==='0105'||c==='091A')return Promise.resolve('NO DATA\r\r>');
+  return Promise.resolve('NO DATA\r\r>');
+}
+
+// =====================
+// PARSERS OBD-II
+// =====================
+
+function parseHexByte(h){return parseInt(h,16);}
+
+function cleanResponse(raw){
+  return raw.replace(/>/g,'').replace(/\r/g,' ').replace(/\n/g,' ').trim();
+}
+
+function parseRPM(raw){
+  // 41 0C AA BB → RPM = ((AA*256)+BB)/4
+  const m=raw.match(/41\s*0C\s*([0-9A-Fa-f]{2})\s*([0-9A-Fa-f]{2})/);
+  if(!m)return null;
+  return Math.round((parseHexByte(m[1])*256+parseHexByte(m[2]))/4);
+}
+function parseSpeed(raw){
+  const m=raw.match(/41\s*0D\s*([0-9A-Fa-f]{2})/);
+  return m?parseHexByte(m[1]):null;
+}
+function parseTemp(raw){
+  // 41 05 AA → Temp = AA - 40
+  const m=raw.match(/41\s*05\s*([0-9A-Fa-f]{2})/);
+  return m?parseHexByte(m[1])-40:null;
+}
+function parseLoad(raw){
+  const m=raw.match(/41\s*04\s*([0-9A-Fa-f]{2})/);
+  return m?Math.round(parseHexByte(m[1])/2.55):null;
+}
+function parseThrottle(raw){
+  const m=raw.match(/41\s*11\s*([0-9A-Fa-f]{2})/);
+  return m?Math.round(parseHexByte(m[1])/2.55):null;
+}
+function parseIgnitionTiming(raw){
+  const m=raw.match(/41\s*0E\s*([0-9A-Fa-f]{2})/);
+  return m?parseHexByte(m[1])/2-64:null;
+}
+function parseIAT(raw){
+  const m=raw.match(/41\s*0F\s*([0-9A-Fa-f]{2})/);
+  return m?parseHexByte(m[1])-40:null;
+}
+function parseMAP(raw){
+  const m=raw.match(/41\s*0B\s*([0-9A-Fa-f]{2})/);
+  return m?parseHexByte(m[1]):null;
+}
+function parseMAF(raw){
+  const m=raw.match(/41\s*10\s*([0-9A-Fa-f]{2})\s*([0-9A-Fa-f]{2})/);
+  return m?((parseHexByte(m[1])*256+parseHexByte(m[2]))/100).toFixed(2):null;
+}
+function parseO2(raw){
+  const m=raw.match(/41\s*14\s*([0-9A-Fa-f]{2})/);
+  return m?(parseHexByte(m[1])/200).toFixed(3):null;
+}
+function parseFuelRate(raw){
+  const m=raw.match(/41\s*5E\s*([0-9A-Fa-f]{2})\s*([0-9A-Fa-f]{2})/);
+  return m?((parseHexByte(m[1])*256+parseHexByte(m[2]))/20).toFixed(1):null;
+}
+function parseMIL(raw){
+  // 41 01 AA ... → bit 7 de AA = MIL on/off
+  const m=raw.match(/41\s*01\s*([0-9A-Fa-f]{2})/);
+  if(!m)return null;
+  const A=parseHexByte(m[1]);
+  return{mil:(A&0x80)!==0, dtcCount:A&0x7F};
+}
+function parseBattery(raw){
+  // ATRV devuelve algo como "12.6V"
+  const m=raw.match(/(\d+\.?\d*)/);
+  return m?parseFloat(m[1]):null;
+}
+
+// Convierte código DTC (P0420) a hex para simulación
+function dtcToHex(code){
+  const prefix={'P':'0','C':'4','B':'8','U':'C'};
+  const p=prefix[code[0]]||'0';
+  const num=parseInt(code.substring(1),10);
+  const b1=parseInt(p+code[1],16);
+  const b2=parseInt(code.substring(2),16);
+  return b1.toString(16).padStart(2,'0').toUpperCase()+' '+b2.toString(16).padStart(2,'0').toUpperCase();
+}
+
+// Parsea respuesta de modo 03/07/0A a lista de DTCs
+function parseDTCs(raw, type){
+  const clean=cleanResponse(raw).toUpperCase();
+  if(clean.includes('NO DATA')||clean.includes('UNABLE')||clean.includes('ERROR'))return[];
+  const modeMap={'stored':'43','pending':'47','permanent':'4A'};
+  const prefix=modeMap[type]||'43';
+  // Quitar el byte de modo de respuesta y parsear pares de bytes
+  const bytes=clean.replace(new RegExp(prefix,'g'),'').trim().split(/\s+/).filter(b=>/^[0-9A-F]{2}$/.test(b));
+  const dtcs=[];
+  for(let i=0;i<bytes.length-1;i+=2){
+    const b1=parseHexByte(bytes[i]);
+    const b2=parseHexByte(bytes[i+1]);
+    if(b1===0&&b2===0)continue;
+    const typeMap={0:'P',1:'P',2:'P',3:'P',4:'C',5:'C',6:'C',7:'C',8:'B',9:'B',10:'B',11:'B',12:'U',13:'U',14:'U',15:'U'};
+    const t=typeMap[(b1>>4)&0xF]||'P';
+    const n1=(b1>>4)&0x3;
+    const n2=b1&0xF;
+    const n3=(b2>>4)&0xF;
+    const n4=b2&0xF;
+    const code=`${t}${n1}${n2}${n3.toString(16).toUpperCase()}${n4.toString(16).toUpperCase()}`;
+    if(code!=='P0000')dtcs.push({code,type});
+  }
+  return dtcs;
+}
+
+// =====================
+// DEMO STATE
+// =====================
 let demoState={rpm:850,speed:0,temp:85,fuel:72,battery:12.6,load:25};
 
 function startDashInterval(){
   stopDashInterval();
   updateDash();
-  dashInterval=setInterval(updateDash,1500);
+  dashInterval=setInterval(updateDash,2000);
 }
 
 function stopDashInterval(){
   if(dashInterval){clearInterval(dashInterval);dashInterval=null;}
 }
 
-function updateDash(){
+async function updateDash(){
   if(!connected)return;
-  if(demoMode||connType==='ble'||connType==='serial'){
-    // Update demo state
+
+  // Modo demo — actualiza estado simulado
+  if(demoMode){
     demoState.rpm=Math.max(650,Math.min(6500,demoState.rpm+rnd(-250,250)));
     demoState.speed=Math.max(0,Math.min(180,demoState.speed+rnd(-8,8)));
     demoState.temp=Math.max(60,Math.min(112,demoState.temp+rnd(-1,2)));
     demoState.fuel=Math.max(5,Math.min(100,demoState.fuel-0.05));
     demoState.battery=parseFloat(Math.max(11.4,Math.min(14.9,demoState.battery+rndF(-0.08,0.08))).toFixed(1));
     demoState.load=Math.max(10,Math.min(90,demoState.load+rnd(-6,6)));
-
-    setGauge('rpm',demoState.rpm,demoState.rpm,7000,demoState.rpm>4500);
-    setGauge('speed',demoState.speed,demoState.speed,220,demoState.speed>150);
-    setGauge('temp',demoState.temp+'°',demoState.temp,120,demoState.temp>95,demoState.temp>105);
-    setGauge('fuel',Math.round(demoState.fuel),demoState.fuel,100,demoState.fuel<20);
-    setGauge('battery',demoState.battery,((demoState.battery-11)/4)*100,100,demoState.battery<12.2);
-    setGauge('load',demoState.load,demoState.load,100,demoState.load>75);
-
-    const milOn=demoState.temp>105||demoState.fuel<12;
-    document.getElementById('milIcon').textContent=milOn?'🔴':'🟢';
-    document.getElementById('milStatus').textContent=milOn?'CHECK ENGINE — ACTIVO':'Sistema Normal';
-    document.getElementById('milStatus').style.color=milOn?'var(--red)':'var(--green)';
-    document.getElementById('milSub').textContent=milOn?'Hay fallas activas. Ve a Escanear Fallas.':'Todos los monitores OK.';
-    document.getElementById('dtcCount').textContent=milOn?rnd(1,3):0;
   }
+
+  // RPM — PID 010C
+  try{
+    const r=await sendCmd('010C');
+    const rpm=parseRPM(r);
+    if(rpm!==null){
+      demoState.rpm=rpm;
+      setGauge('rpm',rpm,rpm,7000,rpm>4500);
+    }
+  }catch(e){}
+
+  // Velocidad — PID 010D
+  try{
+    const r=await sendCmd('010D');
+    const sp=parseSpeed(r);
+    if(sp!==null){
+      demoState.speed=sp;
+      setGauge('speed',sp,sp,220,sp>150);
+    }
+  }catch(e){}
+
+  // Temperatura — PID 0105
+  try{
+    const r=await sendCmd('0105');
+    const t=parseTemp(r);
+    if(t!==null){
+      demoState.temp=t;
+      setGauge('temp',t+'°',t,120,t>95,t>105);
+    }
+  }catch(e){}
+
+  // Carga motor — PID 0104
+  try{
+    const r=await sendCmd('0104');
+    const l=parseLoad(r);
+    if(l!==null){
+      demoState.load=l;
+      setGauge('load',l,l,100,l>75);
+    }
+  }catch(e){}
+
+  // Batería — ATRV
+  try{
+    const r=await sendCmd('ATRV');
+    const b=parseBattery(r);
+    if(b!==null){
+      demoState.battery=b;
+      setGauge('battery',b.toFixed(1),((b-11)/4)*100,100,b<12.2);
+    }
+  }catch(e){}
+
+  // Combustible (estimado desde carga si no hay PID)
+  setGauge('fuel',Math.round(demoState.fuel),demoState.fuel,100,demoState.fuel<20);
+
+  // MIL status — PID 0101
+  try{
+    const r=await sendCmd('0101');
+    const mil=parseMIL(r);
+    if(mil!==null){
+      document.getElementById('milIcon').textContent=mil.mil?'🔴':'🟢';
+      document.getElementById('milStatus').textContent=mil.mil?'CHECK ENGINE — ACTIVO':'Sistema Normal';
+      document.getElementById('milStatus').style.color=mil.mil?'var(--red)':'var(--green)';
+      document.getElementById('milSub').textContent=mil.mil?'Hay fallas activas. Ve a Escanear Fallas.':'Todos los monitores OK.';
+      document.getElementById('dtcCount').textContent=mil.dtcCount;
+    }
+  }catch(e){}
 }
 
 function setGauge(id,display,val,max,warn=false,danger=false){
@@ -1261,7 +1599,7 @@ function setGauge(id,display,val,max,warn=false,danger=false){
 // =====================
 // SCAN
 // =====================
-function startScan(){
+async function startScan(){
   if(!connected){showToast('Conecta el adaptador primero','error','⚠');return;}
   const btn=document.getElementById('scanBtn');
   const circle=document.getElementById('scanCircle');
@@ -1274,45 +1612,51 @@ function startScan(){
   document.getElementById('reportAfterScan').disabled=true;
   document.getElementById('clearBtn').disabled=true;
 
-  const steps=[
-    [10,'Detectando protocolo OBD...'],
-    [25,'Leyendo modo 01 (datos en vivo)...'],
-    [45,'Leyendo DTCs almacenados (modo 03)...'],
-    [65,'Leyendo DTCs pendientes (modo 07)...'],
-    [85,'Leyendo DTCs permanentes (modo 0A)...'],
-    [100,'Escaneo completado ✓']
-  ];
-  let i=0;
-  const run=setInterval(()=>{
-    if(i>=steps.length){
-      clearInterval(run);
-      circle.classList.remove('scanning');
-      circle.textContent='✅';
-      btn.disabled=false;
-      showResults();
-      return;
-    }
-    const[pct,msg]=steps[i];
+  const setProgress=(pct,msg)=>{
     document.getElementById('progressFill').style.width=pct+'%';
     document.getElementById('scanStatusText').textContent=msg;
     addLog(msg,'info');
-    i++;
-  },560);
+  };
+
+  try{
+    setProgress(10,'Detectando protocolo OBD...');
+    await sendCmd('ATSP0'); // Auto-detect protocol
+
+    setProgress(25,'Verificando estado MIL (modo 01)...');
+    const milRaw=await sendCmd('0101');
+    const milData=parseMIL(milRaw);
+
+    setProgress(45,'Leyendo DTCs almacenados (modo 03)...');
+    const storedRaw=await sendCmd('03');
+    const storedDTCs=parseDTCs(storedRaw,'stored');
+
+    setProgress(65,'Leyendo DTCs pendientes (modo 07)...');
+    const pendingRaw=await sendCmd('07');
+    const pendingDTCs=parseDTCs(pendingRaw,'pending');
+
+    setProgress(85,'Leyendo DTCs permanentes (modo 0A)...');
+    const permRaw=await sendCmd('0A');
+    const permDTCs=parseDTCs(permRaw,'permanent');
+
+    setProgress(100,'Escaneo completado ✓');
+    circle.classList.remove('scanning');
+    circle.textContent='✅';
+    btn.disabled=false;
+
+    const allDTCs=[...storedDTCs,...pendingDTCs,...permDTCs];
+    showResults(allDTCs);
+
+  }catch(e){
+    addLog('Error durante el escaneo: '+e.message,'err');
+    showToast('Error en escaneo','error','✗');
+    circle.classList.remove('scanning');
+    circle.textContent='❌';
+    btn.disabled=false;
+  }
 }
 
-function getDemoDTCs(){
-  const pool=[
-    {code:'P0420',type:'stored'},{code:'P0300',type:'stored'},
-    {code:'P0171',type:'pending'},{code:'P0455',type:'stored'},
-    {code:'P0135',type:'pending'},{code:'P0340',type:'stored'}
-  ];
-  const count=rnd(0,3);
-  return pool.slice(0,count);
-}
-
-function showResults(){
-  const dtcs=(demoMode||connType)?getDemoDTCs():[];
-  lastScanData=dtcs;
+function showResults(dtcs){
+  lastScanData=dtcs||[];
   const stored=dtcs.filter(d=>d.type==='stored');
   const pending=dtcs.filter(d=>d.type==='pending');
   const permanent=dtcs.filter(d=>d.type==='permanent');
@@ -1345,21 +1689,26 @@ function showResults(){
   }
 }
 
-function clearDTC(){
+async function clearDTC(){
   if(!confirm('¿Borrar todos los DTCs? Esto apaga la luz Check Engine.'))return;
   addLog('Enviando modo 04 — borrar DTCs...','warn');
-  setTimeout(()=>{
-    document.getElementById('dtcList').innerHTML='<div class="empty-state"><div class="empty-icon">✅</div><p>Códigos borrados. Luz Check Engine apagada.</p></div>';
-    ['r-stored','r-pending','r-permanent'].forEach(id=>document.getElementById(id).textContent='0');
-    document.getElementById('dtcCount').textContent='0';
-    document.getElementById('milIcon').textContent='🟢';
-    document.getElementById('milStatus').textContent='Sistema Normal — Códigos borrados';
-    document.getElementById('milStatus').style.color='var(--green)';
-    document.getElementById('clearBtn').disabled=true;
-    lastScanData=[];
-    addLog('DTCs borrados. MIL apagada.','ok');
-    showToast('Códigos DTC borrados','success','✓');
-  },800);
+  try{
+    const r=await sendCmd('04');
+    const clean=cleanResponse(r);
+    addLog('Respuesta modo 04: '+clean,'ok');
+  }catch(e){
+    addLog('Error borrando DTCs: '+e.message,'err');
+  }
+  document.getElementById('dtcList').innerHTML='<div class="empty-state"><div class="empty-icon">✅</div><p>Códigos borrados. Luz Check Engine apagada.</p></div>';
+  ['r-stored','r-pending','r-permanent'].forEach(id=>document.getElementById(id).textContent='0');
+  document.getElementById('dtcCount').textContent='0';
+  document.getElementById('milIcon').textContent='🟢';
+  document.getElementById('milStatus').textContent='Sistema Normal — Códigos borrados';
+  document.getElementById('milStatus').style.color='var(--green)';
+  document.getElementById('clearBtn').disabled=true;
+  lastScanData=[];
+  addLog('DTCs borrados. MIL apagada.','ok');
+  showToast('Códigos DTC borrados','success','✓');
 }
 
 // =====================
@@ -1377,48 +1726,177 @@ function toggleLive(){
     btn.textContent='⏹ Detener';btn.style.background='#3D0A0A';
     addLog('Monitoreo en vivo iniciado','ok');
     renderLive();
-    liveInterval=setInterval(renderLive,1200);
+    // Polling cada 3s para dar tiempo al loop de PIDs (12 PIDs × ~200ms c/u)
+    liveInterval=setInterval(()=>{if(liveRunning)renderLive();},3000);
   }
 }
 
-function renderLive(){
-  const tbody=document.getElementById('pidBody');tbody.innerHTML='';
-  PIDS.forEach(p=>{
-    const raw=p.min+Math.random()*(p.max-p.min);
-    const val=raw<10?raw.toFixed(2):Math.round(raw);
-    const pct=Math.max(0,Math.min(100,((raw-p.min)/(p.max-p.min))*100));
+async function renderLive(){
+  const tbody=document.getElementById('pidBody');
+  // Mapa PID → parser
+  const pidParsers=[
+    {name:'Velocidad',pid:'010D',unit:'km/h',parse:parseSpeed,max:220},
+    {name:'RPM',pid:'010C',unit:'RPM',parse:parseRPM,max:7000},
+    {name:'Temp. refrigerante',pid:'0105',unit:'°C',parse:parseTemp,max:130},
+    {name:'Carga del motor',pid:'0104',unit:'%',parse:parseLoad,max:100},
+    {name:'Posición acelerador',pid:'0111',unit:'%',parse:parseThrottle,max:100},
+    {name:'Avance encendido',pid:'010E',unit:'°',parse:parseIgnitionTiming,max:64},
+    {name:'Temp. admisión',pid:'010F',unit:'°C',parse:parseIAT,max:100},
+    {name:'Presión MAP',pid:'010B',unit:'kPa',parse:parseMAP,max:255},
+    {name:'Flujo MAF',pid:'0110',unit:'g/s',parse:parseMAF,max:655},
+    {name:'Voltaje batería',pid:'ATRV',unit:'V',parse:parseBattery,max:15},
+    {name:'Sensor O2 B1S1',pid:'0114',unit:'V',parse:parseO2,max:1.275},
+    {name:'Tasa combustible',pid:'015E',unit:'L/h',parse:parseFuelRate,max:50},
+  ];
+
+  tbody.innerHTML='';
+  for(const p of pidParsers){
+    let val=null;
+    try{
+      const raw=await sendCmd(p.pid);
+      val=p.parse(raw);
+    }catch(e){}
+
+    const display=val!==null?val+' '+p.unit:'N/A';
+    const numVal=parseFloat(val)||0;
+    const pct=val!==null?Math.max(0,Math.min(100,(numVal/p.max)*100)):0;
     const warn=pct>85;
     const tr=document.createElement('tr');
-    tr.innerHTML=`<td style="font-size:12px;">${p.name}</td><td><span class="tag-chip">${p.pid}</span></td><td><span class="pid-val">${val} ${p.unit}</span></td><td><div class="mini-bar" style="width:90px"><div class="mini-bar-fill" style="width:${pct.toFixed(0)}%;background:${warn?'var(--yellow)':'var(--blue)'}"></div></div></td><td><span class="pid-status" style="background:${warn?'var(--yellow)':'var(--green)'}"></span></td>`;
+    tr.innerHTML=`<td style="font-size:12px;">${p.name}</td>
+      <td><span class="tag-chip">${p.pid}</span></td>
+      <td><span class="pid-val">${display}</span></td>
+      <td><div class="mini-bar" style="width:90px"><div class="mini-bar-fill" style="width:${pct.toFixed(0)}%;background:${warn?'var(--yellow)':'var(--blue)'}"></div></div></td>
+      <td><span class="pid-status" style="background:${val!==null?(warn?'var(--yellow)':'var(--green)'):'var(--muted)'}"></span></td>`;
     tbody.appendChild(tr);
-  });
+  }
 }
 
 // =====================
 // VEHICLE INFO
 // =====================
-function readVehicleInfo(){
+async function readVehicleInfo(){
   if(!connected)return;
-  setTimeout(()=>{
-    const demo=demoMode||connType==='ble'||connType==='serial';
-    document.getElementById('v-vin').textContent=demo?'1HGCM826'+rnd(10,99)+'A'+rnd(100000,999999):'—';
-    document.getElementById('v-proto').textContent=demo?'ISO 15765-4 CAN (500kbps)':'—';
-    document.getElementById('v-ecu').textContent=demo?'7E8':'—';
-    document.getElementById('v-elm').textContent=demo?'ELM327 v1.5':'—';
-    document.getElementById('v-dist-mil').textContent=demo?rnd(0,5000)+' km':'—';
-    document.getElementById('v-runtime').textContent=demo?rnd(10,3600)+' s':'—';
-    document.getElementById('v-km-clear').textContent=demo?rnd(100,50000)+' km':'—';
-    document.getElementById('v-warmups').textContent=demo?rnd(5,100):'—';
-    document.getElementById('v-fuel-type').textContent=demo?'Gasolina (Gasoline)':'—';
-    document.getElementById('v-fuel-press').textContent=demo?rnd(300,800)+' kPa':'—';
-    document.getElementById('v-fuel-rate').textContent=demo?rndF(2,12)+' L/h':'—';
-    document.getElementById('v-evap').textContent=demo?'OK':'—';
-    document.getElementById('v-iat').textContent=demo?rnd(20,55)+'°C':'—';
-    document.getElementById('v-amb').textContent=demo?rnd(15,38)+'°C':'—';
-    document.getElementById('v-baro').textContent=demo?rnd(95,105)+' kPa':'—';
-    document.getElementById('v-map').textContent=demo?rnd(20,120)+' kPa':'—';
-    addLog('Info del vehículo actualizada','ok');
-  },600);
+  addLog('Leyendo información del vehículo...','info');
+
+  // VIN — Modo 09 PID 02
+  try{
+    const r=await sendCmd('0902');
+    const clean=cleanResponse(r).replace(/49\s*02\s*/gi,'').replace(/\s+/g,'');
+    if(clean&&!clean.includes('NODATA')&&!clean.includes('ERROR')){
+      // Convertir hex a ASCII
+      let vin='';
+      for(let i=0;i<clean.length-1;i+=2){
+        const c=parseInt(clean.substring(i,i+2),16);
+        if(c>31&&c<127)vin+=String.fromCharCode(c);
+      }
+      document.getElementById('v-vin').textContent=vin||'No disponible';
+    }else{
+      document.getElementById('v-vin').textContent='No disponible';
+    }
+  }catch(e){document.getElementById('v-vin').textContent='Error';}
+
+  // Protocolo detectado
+  try{
+    const r=await sendCmd('ATDP');
+    document.getElementById('v-proto').textContent=cleanResponse(r).replace(/>/g,'').trim()||'Auto';
+  }catch(e){}
+
+  // Versión ELM
+  try{
+    const r=await sendCmd('ATI');
+    document.getElementById('v-elm').textContent=cleanResponse(r).replace(/>/g,'').trim();
+  }catch(e){}
+
+  document.getElementById('v-ecu').textContent='7E8';// Standard ECU address
+
+  // Distancia con MIL — PID 0121
+  try{
+    const r=await sendCmd('0121');
+    const m=r.match(/41\s*21\s*([0-9A-Fa-f]{2})\s*([0-9A-Fa-f]{2})/);
+    if(m)document.getElementById('v-dist-mil').textContent=(parseHexByte(m[1])*256+parseHexByte(m[2]))+' km';
+    else document.getElementById('v-dist-mil').textContent='No soportado';
+  }catch(e){}
+
+  // Tiempo encendido — PID 011F
+  try{
+    const r=await sendCmd('011F');
+    const m=r.match(/41\s*1F\s*([0-9A-Fa-f]{2})\s*([0-9A-Fa-f]{2})/);
+    if(m)document.getElementById('v-runtime').textContent=(parseHexByte(m[1])*256+parseHexByte(m[2]))+' s';
+    else document.getElementById('v-runtime').textContent='No soportado';
+  }catch(e){}
+
+  // Km desde borrado — PID 0131
+  try{
+    const r=await sendCmd('0131');
+    const m=r.match(/41\s*31\s*([0-9A-Fa-f]{2})\s*([0-9A-Fa-f]{2})/);
+    if(m)document.getElementById('v-km-clear').textContent=(parseHexByte(m[1])*256+parseHexByte(m[2]))+' km';
+    else document.getElementById('v-km-clear').textContent='No soportado';
+  }catch(e){}
+
+  // Calentamientos — PID 0130
+  try{
+    const r=await sendCmd('0130');
+    const m=r.match(/41\s*30\s*([0-9A-Fa-f]{2})/);
+    if(m)document.getElementById('v-warmups').textContent=parseHexByte(m[1]);
+    else document.getElementById('v-warmups').textContent='No soportado';
+  }catch(e){}
+
+  // Tipo de combustible — PID 0151
+  try{
+    const r=await sendCmd('0151');
+    const m=r.match(/41\s*51\s*([0-9A-Fa-f]{2})/);
+    const fuelTypes={1:'Gasolina',2:'Metanol',3:'Etanol',4:'Diésel',5:'GLP',6:'GNV',8:'Eléctrico',9:'Híbrido'};
+    if(m)document.getElementById('v-fuel-type').textContent=fuelTypes[parseHexByte(m[1])]||'Desconocido';
+    else document.getElementById('v-fuel-type').textContent='No soportado';
+  }catch(e){}
+
+  // Presión combustible — PID 010A
+  try{
+    const r=await sendCmd('010A');
+    const m=r.match(/41\s*0A\s*([0-9A-Fa-f]{2})/);
+    if(m)document.getElementById('v-fuel-press').textContent=(parseHexByte(m[1])*3)+' kPa';
+    else document.getElementById('v-fuel-press').textContent='No soportado';
+  }catch(e){}
+
+  // Tasa combustible — PID 015E
+  try{
+    const r=await sendCmd('015E');
+    const v=parseFuelRate(r);
+    document.getElementById('v-fuel-rate').textContent=v?v+' L/h':'No soportado';
+  }catch(e){}
+
+  // Temperatura admisión — PID 010F
+  try{
+    const r=await sendCmd('010F');
+    const v=parseIAT(r);
+    document.getElementById('v-iat').textContent=v!==null?v+'°C':'No soportado';
+  }catch(e){}
+
+  // Presión barométrica — PID 0133
+  try{
+    const r=await sendCmd('0133');
+    const m=r.match(/41\s*33\s*([0-9A-Fa-f]{2})/);
+    if(m)document.getElementById('v-baro').textContent=parseHexByte(m[1])+' kPa';
+    else document.getElementById('v-baro').textContent='No soportado';
+  }catch(e){}
+
+  // Presión MAP — PID 010B
+  try{
+    const r=await sendCmd('010B');
+    const v=parseMAP(r);
+    document.getElementById('v-map').textContent=v!==null?v+' kPa':'No soportado';
+  }catch(e){}
+
+  // Temp ambiente — PID 0146
+  try{
+    const r=await sendCmd('0146');
+    const m=r.match(/41\s*46\s*([0-9A-Fa-f]{2})/);
+    if(m)document.getElementById('v-amb').textContent=(parseHexByte(m[1])-40)+'°C';
+    else document.getElementById('v-amb').textContent='No soportado';
+  }catch(e){}
+
+  document.getElementById('v-evap').textContent='Ver monitores OBD';
+  addLog('Info del vehículo actualizada','ok');
 }
 
 // =====================
@@ -1601,11 +2079,17 @@ function downloadPDF(){
 
     if(d.incPids){
       secTitle('PARAMETROS PID REGISTRADOS');
-      PIDS.forEach((p,i)=>{
+      const pidSnapshot=[
+        {name:'RPM',unit:'RPM',val:document.getElementById('g-rpm').textContent},
+        {name:'Velocidad',unit:'km/h',val:document.getElementById('g-speed').textContent},
+        {name:'Temp. Refrigerante',unit:'°C',val:document.getElementById('g-temp').textContent},
+        {name:'Carga del Motor',unit:'%',val:document.getElementById('g-load').textContent},
+        {name:'Voltaje Batería',unit:'V',val:document.getElementById('g-battery').textContent},
+        {name:'Combustible',unit:'%',val:document.getElementById('g-fuel').textContent},
+      ];
+      pidSnapshot.forEach((p,i)=>{
         if(y>272){doc.addPage();y=20;}
-        const raw=p.min+Math.random()*(p.max-p.min);
-        const val=raw<10?raw.toFixed(2):Math.round(raw);
-        row(p.name,val+' '+p.unit,i%2===1);
+        row(p.name,p.val+' '+p.unit,i%2===1);
       });
       y+=4;
     }
